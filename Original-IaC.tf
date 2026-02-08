@@ -1,3 +1,13 @@
+## Reduced number of NAT Gateways to one to cut substantial hourly and data processing costs.
+resource "aws_eip" "nat_eip_a" {
+  vpc = true
+}
+
+resource "aws_nat_gateway" "nat_gateway_a" {
+  allocation_id = aws_eip.nat_eip_a.id
+  subnet_id     = aws_subnet.public_a.id
+}
+
 data "aws_availability_zones" "available" {
   state = "available"
 }
@@ -128,24 +138,6 @@ resource "aws_subnet" "private_b" {
 ###########################
 ###### NAT 
 ###########################
-resource "aws_eip" "nat_eip_a" {
-  vpc = true
-}
-
-resource "aws_eip" "nat_eip_b" {
-  vpc = true
-}
-
-resource "aws_nat_gateway" "nat_gateway_a" {
-  allocation_id = aws_eip.nat_eip_a.id
-  subnet_id     = aws_subnet.public_a.id
-}
-
-resource "aws_nat_gateway" "nat_gateway_b" {
-  allocation_id = aws_eip.nat_eip_b.id
-  subnet_id     = aws_subnet.public_b.id
-}
-
 resource "aws_route_table" "public_route_table" {
   vpc_id = aws_vpc.saladapi_vpc.id
 
@@ -302,14 +294,15 @@ resource "aws_iam_role_policy_attachment" "ecs_secrets_access_attachment" {
   policy_arn = aws_iam_policy.ecs_secrets_access_policy.arn
 }
 
+## Lowered task CPU and memory to the smallest Fargate-compatible configuration to reduce runtime cost.
 resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   family                   = "saladapi_task"
   network_mode            = "awsvpc"
   requires_compatibilities = ["FARGATE"]
   execution_role_arn      = aws_iam_role.ecs_task_execution_role.arn
 
-  cpu                     = "512"
-  memory                  = "1024"
+  cpu                     = "256"
+  memory                  = "512"
 
   container_definitions = jsonencode([
     {
@@ -317,7 +310,6 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
       image     = "ghcr.io/serverlesssalad/kotlin-spring-postgres-demo-app:latest"
       portMappings = [{
         containerPort = 8080
-        hostPort      = 8080
         protocol      = "tcp"
       }]
       environment = [
@@ -348,13 +340,18 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   ])
 }
 
+## Use FARGATE_SPOT capacity provider to run tasks on Spot Fargate for significant cost savings.
 resource "aws_ecs_service" "saladapi_ecs_service" {
   name            = "saladapi_service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.saladapi_ecs_task_definition.id
   desired_count   = 1
-  launch_type     = "FARGATE"
   wait_for_steady_state = true
+
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 1
+  }
   
   network_configuration {
     subnets          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
@@ -397,6 +394,8 @@ resource "aws_db_subnet_group" "saladapi_subnet_group" {
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
 }
 
+## Disabled automated backups to reduce storage costs (risk: no automated backups).
+## Kept instance_class as db.t3.micro as it is the most cost-efficient burstable option.
 resource "aws_db_instance" "saladapi_postgres_cluster" {
   identifier      = "saladapi-postgres-db"
   engine                 = "postgres"
@@ -408,6 +407,8 @@ resource "aws_db_instance" "saladapi_postgres_cluster" {
   vpc_security_group_ids  = [aws_security_group.db_sg.id]
   db_subnet_group_name    = aws_db_subnet_group.saladapi_subnet_group.name
   skip_final_snapshot     = true
+  backup_retention_period = 0
+  deletion_protection     = false
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -417,9 +418,10 @@ resource "aws_ecs_cluster" "main" {
 ###########################
 ###### CloudWatch 
 ###########################
+## Reduced log retention to minimize CloudWatch storage costs.
 resource "aws_cloudwatch_log_group" "ecs_log_group" {
   name              = "/ecs/saladapi-app-log-group"
-  retention_in_days = 7
+  retention_in_days = 3
 }
 
 ###########################
