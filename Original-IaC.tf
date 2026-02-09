@@ -1,64 +1,4 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-variable "aws_region" {
-  type        = string
-  description = "The region in which the resources will be created"
-  default     = null  # Set default to null
-}
-
-variable "aws_profile" {
-  description = "AWS profile to use"
-  type        = string
-  default     = null  # Set default to null
-}
-
-variable "aws_role_arn" {
-  description = "AWS ROLE ARN"
-  type        = string
-  default     = null
-}
-
-variable "aws_external_id" {
-  description = "AWS External ID"
-  type        = string
-  default     = null
-}
-
-variable "db_name" {
-  type        = string
-  description = "Database name"
-  default     = "saladapi_db"
-}
-
-variable "db_username" {
-  type        = string
-  description = "Username for the database"
-  default     = "saladapi_db_admin"  # Changed to a reserved username
-}
-
-resource "random_string" "secret_suffix" {
-  length  = 4
-  special = false
-  upper   = false
-  lower   = true 
-  numeric = false
-}
-
-locals {
-  service_name = "saladapi-${random_string.secret_suffix.result}"
-  db_pw_secret_name = "saladapi_db_pw-${random_string.secret_suffix.result}"
-  db_password = random_password.db_pw.result
-  middleware_db_password = local.db_password
-}
-
-resource "random_password" "db_pw" {
-  length  = 16
-  special = true
-  override_special = "!*()-_="
-}
-
+## Using AWS providers required by the configuration
 terraform {
   required_providers {
     aws = {
@@ -86,6 +26,67 @@ provider "aws" {
   }
 }
 
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+variable "aws_region" {
+  type        = string
+  description = "The region in which the resources will be created"
+  default     = null
+}
+
+variable "aws_profile" {
+  description = "AWS profile to use"
+  type        = string
+  default     = null
+}
+
+variable "aws_role_arn" {
+  description = "AWS ROLE ARN"
+  type        = string
+  default     = null
+}
+
+variable "aws_external_id" {
+  description = "AWS External ID"
+  type        = string
+  default     = null
+}
+
+variable "db_name" {
+  type        = string
+  description = "Database name"
+  default     = "saladapi_db"
+}
+
+variable "db_username" {
+  type        = string
+  description = "Username for the database"
+  default     = "saladapi_db_admin"
+}
+
+resource "random_string" "secret_suffix" {
+  length  = 4
+  special = false
+  upper   = false
+  lower   = true
+  numeric = false
+}
+
+resource "random_password" "db_pw" {
+  length  = 16
+  special = true
+  override_special = "!*()-_="
+}
+
+locals {
+  service_name = "saladapi-${random_string.secret_suffix.result}"
+  db_pw_secret_name = "saladapi_db_pw-${random_string.secret_suffix.result}"
+  db_password = random_password.db_pw.result
+  middleware_db_password = local.db_password
+}
+
 ###########################
 ###### VPC 
 ###########################
@@ -99,6 +100,7 @@ resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.saladapi_vpc.id
 }
 
+## Use a single public subnet (single AZ) to reduce costs associated with multi-AZ resources (fewer ALB nodes, no additional NATs/EIPs).
 resource "aws_subnet" "public_a" {
   vpc_id                  = aws_vpc.saladapi_vpc.id
   cidr_block              = "10.0.1.0/24"
@@ -106,46 +108,17 @@ resource "aws_subnet" "public_a" {
   map_public_ip_on_launch = true
 }
 
-resource "aws_subnet" "public_b" {
-  vpc_id                  = aws_vpc.saladapi_vpc.id
-  cidr_block              = "10.0.2.0/24"
-  availability_zone       = data.aws_availability_zones.available.names[1]
-  map_public_ip_on_launch = true
-}
-
+## Use a single private subnet (single AZ) to reduce resource counts and costs.
 resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.saladapi_vpc.id
   cidr_block        = "10.0.3.0/24"
   availability_zone = data.aws_availability_zones.available.names[0]
 }
 
-resource "aws_subnet" "private_b" {
-  vpc_id            = aws_vpc.saladapi_vpc.id
-  cidr_block        = "10.0.4.0/24"
-  availability_zone = data.aws_availability_zones.available.names[1]
-}
-
 ###########################
-###### NAT 
+###### Routing and NAT
 ###########################
-resource "aws_eip" "nat_eip_a" {
-  vpc = true
-}
-
-resource "aws_eip" "nat_eip_b" {
-  vpc = true
-}
-
-resource "aws_nat_gateway" "nat_gateway_a" {
-  allocation_id = aws_eip.nat_eip_a.id
-  subnet_id     = aws_subnet.public_a.id
-}
-
-resource "aws_nat_gateway" "nat_gateway_b" {
-  allocation_id = aws_eip.nat_eip_b.id
-  subnet_id     = aws_subnet.public_b.id
-}
-
+## Remove NAT Gateways and EIPs to avoid their significant hourly costs. Instead ECS tasks will run in public subnets with public IPs.
 resource "aws_route_table" "public_route_table" {
   vpc_id = aws_vpc.saladapi_vpc.id
 
@@ -160,27 +133,13 @@ resource "aws_route_table_association" "public_a_association" {
   route_table_id = aws_route_table.public_route_table.id
 }
 
-resource "aws_route_table_association" "public_b_association" {
-  subnet_id      = aws_subnet.public_b.id
-  route_table_id = aws_route_table.public_route_table.id
-}
-
+## Private route table intentionally has no default route to internet to avoid NAT costs. RDS does not require outbound internet access.
 resource "aws_route_table" "private_route_table" {
   vpc_id = aws_vpc.saladapi_vpc.id
-
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.nat_gateway_a.id
-  }
 }
 
 resource "aws_route_table_association" "private_a_association" {
   subnet_id      = aws_subnet.private_a.id
-  route_table_id = aws_route_table.private_route_table.id
-}
-
-resource "aws_route_table_association" "private_b_association" {
-  subnet_id      = aws_subnet.private_b.id
   route_table_id = aws_route_table.private_route_table.id
 }
 
@@ -302,14 +261,15 @@ resource "aws_iam_role_policy_attachment" "ecs_secrets_access_attachment" {
   policy_arn = aws_iam_policy.ecs_secrets_access_policy.arn
 }
 
+## Reduce task CPU and memory to the smallest practical Fargate sizing (256 CPU, 512 MiB) to lower Fargate costs.
 resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   family                   = "saladapi_task"
-  network_mode            = "awsvpc"
+  network_mode             = "awsvpc"
   requires_compatibilities = ["FARGATE"]
-  execution_role_arn      = aws_iam_role.ecs_task_execution_role.arn
+  execution_role_arn       = aws_iam_role.ecs_task_execution_role.arn
 
-  cpu                     = "512"
-  memory                  = "1024"
+  cpu    = "256"
+  memory = "512"
 
   container_definitions = jsonencode([
     {
@@ -317,7 +277,6 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
       image     = "ghcr.io/serverlesssalad/kotlin-spring-postgres-demo-app:latest"
       portMappings = [{
         containerPort = 8080
-        hostPort      = 8080
         protocol      = "tcp"
       }]
       environment = [
@@ -348,18 +307,29 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   ])
 }
 
+## Use FARGATE_SPOT to reduce runtime costs by allowing tasks to run on spare capacity. Fallback to regular FARGATE if spot is unavailable.
 resource "aws_ecs_service" "saladapi_ecs_service" {
   name            = "saladapi_service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.saladapi_ecs_task_definition.id
   desired_count   = 1
-  launch_type     = "FARGATE"
   wait_for_steady_state = true
-  
+
+  # Use capacity provider strategy to prefer FARGATE_SPOT
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 1
+  }
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE"
+    weight            = 1
+  }
+
   network_configuration {
-    subnets          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+    # Run tasks in public subnet with public IPs to avoid NAT Gateways costs.
+    subnets          = [aws_subnet.public_a.id]
     security_groups  = [aws_security_group.ecs_task_sg.id]
-    assign_public_ip = false
+    assign_public_ip = true
   }
 
   load_balancer {
@@ -370,7 +340,7 @@ resource "aws_ecs_service" "saladapi_ecs_service" {
 }
 
 ###########################
-###### Middleware 
+###### Middleware (RDS)
 ###########################
 resource "aws_security_group" "db_sg" {
   name        = "saladapi_db_sg"
@@ -388,15 +358,16 @@ resource "aws_security_group" "db_sg" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]  # Allow all outbound traffic
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
 resource "aws_db_subnet_group" "saladapi_subnet_group" {
   name       = "saladapi_db_subnet_group"
-  subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
+  subnet_ids = [aws_subnet.private_a.id]
 }
 
+## Reduce RDS backup retention to 0 to avoid snapshot storage costs in a development/cost-sensitive environment.
 resource "aws_db_instance" "saladapi_postgres_cluster" {
   identifier      = "saladapi-postgres-db"
   engine                 = "postgres"
@@ -408,6 +379,7 @@ resource "aws_db_instance" "saladapi_postgres_cluster" {
   vpc_security_group_ids  = [aws_security_group.db_sg.id]
   db_subnet_group_name    = aws_db_subnet_group.saladapi_subnet_group.name
   skip_final_snapshot     = true
+  backup_retention_period = 0
 }
 
 resource "aws_ecs_cluster" "main" {
@@ -425,12 +397,13 @@ resource "aws_cloudwatch_log_group" "ecs_log_group" {
 ###########################
 ###### ALB 
 ###########################
+## Use a single subnet for the ALB to reduce per-AZ load balancer costs (less redundancy but lower cost).
 resource "aws_lb" "app_lb" {
   name               = "saladapi-lb"
   internal           = false
   load_balancer_type = "application"
   security_groups    = [aws_security_group.saladapi_alb_sg.id]
-  subnets            = [aws_subnet.public_a.id, aws_subnet.public_b.id]
+  subnets            = [aws_subnet.public_a.id]
 }
 
 resource "aws_lb_target_group" "api_tg" {
