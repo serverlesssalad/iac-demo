@@ -1,64 +1,3 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-}
-
-variable "aws_region" {
-  type        = string
-  description = "The region in which the resources will be created"
-  default     = null  # Set default to null
-}
-
-variable "aws_profile" {
-  description = "AWS profile to use"
-  type        = string
-  default     = null  # Set default to null
-}
-
-variable "aws_role_arn" {
-  description = "AWS ROLE ARN"
-  type        = string
-  default     = null
-}
-
-variable "aws_external_id" {
-  description = "AWS External ID"
-  type        = string
-  default     = null
-}
-
-variable "db_name" {
-  type        = string
-  description = "Database name"
-  default     = "saladapi_db"
-}
-
-variable "db_username" {
-  type        = string
-  description = "Username for the database"
-  default     = "saladapi_db_admin"  # Changed to a reserved username
-}
-
-resource "random_string" "secret_suffix" {
-  length  = 4
-  special = false
-  upper   = false
-  lower   = true 
-  numeric = false
-}
-
-locals {
-  service_name = "saladapi-${random_string.secret_suffix.result}"
-  db_pw_secret_name = "saladapi_db_pw-${random_string.secret_suffix.result}"
-  db_password = random_password.db_pw.result
-  middleware_db_password = local.db_password
-}
-
-resource "random_password" "db_pw" {
-  length  = 16
-  special = true
-  override_special = "!*()-_="
-}
-
 terraform {
   required_providers {
     aws = {
@@ -84,6 +23,67 @@ provider "aws" {
       external_id = var.aws_external_id
     }
   }
+}
+
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
+variable "aws_region" {
+  type        = string
+  description = "The region in which the resources will be created"
+  default     = null
+}
+
+variable "aws_profile" {
+  description = "AWS profile to use"
+  type        = string
+  default     = null
+}
+
+variable "aws_role_arn" {
+  description = "AWS ROLE ARN"
+  type        = string
+  default     = null
+}
+
+variable "aws_external_id" {
+  description = "AWS External ID"
+  type        = string
+  default     = null
+}
+
+variable "db_name" {
+  type        = string
+  description = "Database name"
+  default     = "saladapi_db"
+}
+
+variable "db_username" {
+  type        = string
+  description = "Username for the database"
+  default     = "saladapi_db_admin"
+}
+
+resource "random_string" "secret_suffix" {
+  length  = 4
+  special = false
+  upper   = false
+  lower   = true
+  numeric = false
+}
+
+locals {
+  service_name         = "saladapi-${random_string.secret_suffix.result}"
+  db_pw_secret_name    = "saladapi_db_pw-${random_string.secret_suffix.result}"
+  db_password          = random_password.db_pw.result
+  middleware_db_password = local.db_password
+}
+
+resource "random_password" "db_pw" {
+  length           = 16
+  special          = true
+  override_special = "!*()-_="
 }
 
 ###########################
@@ -128,22 +128,14 @@ resource "aws_subnet" "private_b" {
 ###########################
 ###### NAT 
 ###########################
+## Use a single NAT Gateway and EIP to reduce hourly NAT gateway and EIP costs.
 resource "aws_eip" "nat_eip_a" {
-  vpc = true
-}
-
-resource "aws_eip" "nat_eip_b" {
   vpc = true
 }
 
 resource "aws_nat_gateway" "nat_gateway_a" {
   allocation_id = aws_eip.nat_eip_a.id
   subnet_id     = aws_subnet.public_a.id
-}
-
-resource "aws_nat_gateway" "nat_gateway_b" {
-  allocation_id = aws_eip.nat_eip_b.id
-  subnet_id     = aws_subnet.public_b.id
 }
 
 resource "aws_route_table" "public_route_table" {
@@ -185,16 +177,14 @@ resource "aws_route_table_association" "private_b_association" {
 }
 
 ###########################
-###### Secret Manager 
+###### SSM Parameter (replaces Secrets Manager)
 ###########################
-resource "aws_secretsmanager_secret" "saladapi_db_pw_secret" {
-  name                     = local.db_pw_secret_name
-  recovery_window_in_days  = 0
-}
-
-resource "aws_secretsmanager_secret_version" "saladapi_db_pw_version" {
-  secret_id     = aws_secretsmanager_secret.saladapi_db_pw_secret.id
-  secret_string = local.middleware_db_password
+## Store DB password in SSM Parameter Store (standard String) to avoid Secrets Manager monthly charges.
+resource "aws_ssm_parameter" "saladapi_db_pw_parameter" {
+  name  = local.db_pw_secret_name
+  type  = "String"
+  value = local.middleware_db_password
+  overwrite = true
 }
 
 ###########################
@@ -278,19 +268,21 @@ resource "aws_iam_role_policy" "ecs_task_execution_policy" {
   })
 }
 
+## Allow ECS tasks to read the DB password from SSM Parameter Store (cheaper than Secrets Manager)
 resource "aws_iam_policy" "ecs_secrets_access_policy" {
-  name        = "saladapi_secrets_access_policy"
-  description = "Allow ECS tasks to access Secrets Manager"
+  name        = "saladapi_ssm_access_policy"
+  description = "Allow ECS tasks to access SSM Parameter Store for DB password"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
         Effect   = "Allow"
         Action   = [
-          "secretsmanager:GetSecretValue"
+          "ssm:GetParameter",
+          "ssm:GetParameters"
         ]
         Resource = [
-          aws_secretsmanager_secret.saladapi_db_pw_secret.arn
+          aws_ssm_parameter.saladapi_db_pw_parameter.arn
         ]
       }
     ]
@@ -308,8 +300,9 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   requires_compatibilities = ["FARGATE"]
   execution_role_arn      = aws_iam_role.ecs_task_execution_role.arn
 
-  cpu                     = "512"
-  memory                  = "1024"
+  ## Reduce CPU and memory to the smallest supported Fargate combination to lower runtime cost.
+  cpu                     = "256"
+  memory                  = "512"
 
   container_definitions = jsonencode([
     {
@@ -333,7 +326,7 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
       secrets = [
         {
           name      = "DB_PASSWORD"
-          valueFrom = aws_secretsmanager_secret.saladapi_db_pw_secret.arn
+          valueFrom = aws_ssm_parameter.saladapi_db_pw_parameter.arn
         }
       ]
       logConfiguration = {
@@ -348,14 +341,24 @@ resource "aws_ecs_task_definition" "saladapi_ecs_task_definition" {
   ])
 }
 
+resource "aws_ecs_cluster" "main" {
+  name = "saladapi_cluster"
+}
+
 resource "aws_ecs_service" "saladapi_ecs_service" {
   name            = "saladapi_service"
   cluster         = aws_ecs_cluster.main.id
   task_definition = aws_ecs_task_definition.saladapi_ecs_task_definition.id
   desired_count   = 1
-  launch_type     = "FARGATE"
   wait_for_steady_state = true
-  
+
+  ## Use FARGATE_SPOT capacity provider to reduce Fargate task costs by leveraging spot pricing.
+  capacity_provider_strategy {
+    capacity_provider = "FARGATE_SPOT"
+    weight            = 1
+    base              = 0
+  }
+
   network_configuration {
     subnets          = [aws_subnet.private_a.id, aws_subnet.private_b.id]
     security_groups  = [aws_security_group.ecs_task_sg.id]
@@ -388,7 +391,7 @@ resource "aws_security_group" "db_sg" {
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]  # Allow all outbound traffic
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
@@ -397,29 +400,30 @@ resource "aws_db_subnet_group" "saladapi_subnet_group" {
   subnet_ids = [aws_subnet.private_a.id, aws_subnet.private_b.id]
 }
 
+## Disable automated backups to reduce storage costs (accept trade-offs for cost savings).
 resource "aws_db_instance" "saladapi_postgres_cluster" {
-  identifier      = "saladapi-postgres-db"
+  identifier             = "saladapi-postgres-db"
   engine                 = "postgres"
-  instance_class          = "db.t3.micro"
-  allocated_storage        = 20
-  username                = var.db_username
-  password                = local.middleware_db_password
-  db_name                 = var.db_name
-  vpc_security_group_ids  = [aws_security_group.db_sg.id]
-  db_subnet_group_name    = aws_db_subnet_group.saladapi_subnet_group.name
-  skip_final_snapshot     = true
-}
-
-resource "aws_ecs_cluster" "main" {
-  name = "saladapi_cluster"
+  instance_class         = "db.t3.micro"
+  allocated_storage      = 20
+  username               = var.db_username
+  password               = local.middleware_db_password
+  db_name                = var.db_name
+  vpc_security_group_ids = [aws_security_group.db_sg.id]
+  db_subnet_group_name   = aws_db_subnet_group.saladapi_subnet_group.name
+  skip_final_snapshot    = true
+  backup_retention_period = 0
+  deletion_protection     = false
+  multi_az                = false
 }
 
 ###########################
 ###### CloudWatch 
 ###########################
+## Reduce log retention to 3 days to lower CloudWatch storage costs while keeping short-term logs.
 resource "aws_cloudwatch_log_group" "ecs_log_group" {
   name              = "/ecs/saladapi-app-log-group"
-  retention_in_days = 7
+  retention_in_days = 3
 }
 
 ###########################
